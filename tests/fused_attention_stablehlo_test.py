@@ -17,9 +17,10 @@ from absl.testing import absltest
 import os
 
 os.environ["XLA_FLAGS"] = \
-  "--xla_gpu_enable_cudnn_fmha=true --xla_gpu_fused_attention_use_cudnn_rng=true"
+  "--xla_gpu_enable_cudnn_fmha=true --xla_gpu_fused_attention_use_cudnn_rng=true --xla_dump_to=./hlo --xla_dump_hlo_as_text"
 
 import numpy as np
+import math
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -48,22 +49,40 @@ def sdpa_train(query: Array,
                mask_type: MaskType = MaskType.NO_MASK,
                is_bnth: bool = False,
                dropout_rate: float = 0.1,
-               sliding_window_length: int | None = None) -> Array:
+               sliding_window_length: int | None = None,
+               is_packed: bool = False) -> Array:
+  if is_bnth:
+    B, N, S, H = query.shape
+  else:
+    B, S, N, H = query.shape
+
   if mask_type == MaskType.PADDING:
-    if is_bnth:
-      B, _, S, _ = query.shape
-    else:
-      B, S, _, _ = query.shape
     q_seqlen = kv_seqlen = jnp.full((B,), S // 2, jnp.int32)
   else:
     q_seqlen = kv_seqlen = None
+
+  if is_packed and not is_bnth:
+    # generate packed layout information
+    # set segment offset
+    print("called")
+    num_segments = 3
+    segment_size = S // num_segments
+    offsets = jax.lax.iota(np.int32, num_segments) * segment_size * N * H
+    offsets = jnp.concatenate([offsets, jnp.array([-1], dtype=np.int32)])
+    q_offsets = kv_offsets = jax.lax.broadcast(offsets, (B,))
+    # set actual seqlen of each segment as well
+    seqlen = jnp.ones(num_segments, dtype=np.int32) * segment_size
+    q_seqlen = kv_seqlen = jax.lax.broadcast(seqlen, (B,))
+  else:
+    q_offsets = kv_offsets = None
+
   out, sdpa_vjp = jax.vjp(
       partial(dot_product_attention, scale=scale, mask_type=mask_type,
               dropout_rate=dropout_rate,
               qkv_layout="BNTH" if is_bnth else "BTNH",
               sliding_window_length=sliding_window_length),
-      query, key, value, bias, mask, q_seqlen, kv_seqlen)
-  query_grad, key_grad, value_grad, bias_grad, _, _, _ = sdpa_vjp(grad)
+      query, key, value, bias, mask, q_seqlen, kv_seqlen, q_offsets, kv_offsets)
+  query_grad, key_grad, value_grad, bias_grad = sdpa_vjp(grad)[:4]
   if bias is not None and len(bias.shape) == 3:
     # has dbias
     return out, (query_grad, key_grad, value_grad, bias_grad)
@@ -77,7 +96,8 @@ def sdpa_ref(query: Array,
       scale: float = 0.5,
       mask_type: MaskType = MaskType.NO_MASK,
       dropout_rate: float = 0.1,
-      sliding_window_length: int | None = None) -> Array:
+      sliding_window_length: int | None = None,
+      is_packed: bool = False) -> Array:
 
   def get_causal_mask(logits):
     large_negative_number = get_large_negative_number(logits.dtype)
@@ -112,6 +132,25 @@ def sdpa_ref(query: Array,
       col_idx <= row_idx - window_length).astype(logits.dtype) * large_negative_number
     return mask[(*([jnp.newaxis]*(len(logits.shape) - 2)), ...)]
 
+  def get_segment_mask(logits):
+    # use a fixed pattern for segment_id where each batch has 3 segments
+    # with same size, fill the rest with padded tokens
+    T = logits.shape[-2]
+    num_segments = 3
+    segment_size = T // num_segments
+    # [T]
+    segment_ids = jax.lax.iota(np.int32, T) // segment_size
+    # [1, T]
+    segment_ids_1 = jnp.expand_dims(segment_ids, axis=-1)
+    # [T, 1]
+    segment_ids_2 = jnp.expand_dims(segment_ids, axis=1)
+    # [T, T].
+    mask = jnp.not_equal(segment_ids_1, segment_ids_2).astype(logits.dtype)
+    # broadcast to [B, N, T, T]
+    mask = jax.lax.broadcast(mask, logits.shape[:-2])
+    mask *= get_large_negative_number(logits.dtype)
+    return mask
+
   B, T, qN, H = query.shape
   _, _, kN, _ = key.shape
   logits = jnp.einsum("bqhd,bkhd->bhqk", query, key)
@@ -126,6 +165,9 @@ def sdpa_ref(query: Array,
       raise ValueError(
         f"Expect sliding_window_length > 0, got {sliding_window_length}.")
     bias = get_sliding_window_mask(logits, sliding_window_length)
+  elif is_packed:
+    bias = get_segment_mask(logits)
+
   if mask is not None:
     large_negative_number = get_large_negative_number(logits.dtype)
     mask = jnp.where(mask, jnp.asarray(0, query.dtype), large_negative_number)
@@ -160,11 +202,12 @@ def sdpa_train_ref(query: Array,
             scale: float = 0.5,
             mask_type: MaskType = MaskType.NO_MASK,
             dropout_rate: float = 0.1,
-            sliding_window_length: int | None = None) -> Array:
+            sliding_window_length: int | None = None,
+            is_packed: bool = False) -> Array:
   out_ref, sdpa_vjp_ref = jax.vjp(
     partial(
       sdpa_ref, scale=scale, mask_type=mask_type, dropout_rate=dropout_rate,
-      sliding_window_length=sliding_window_length),
+      sliding_window_length=sliding_window_length, is_packed=is_packed),
     query, key, value, bias, mask)
   query_grad_ref, key_grad_ref, value_grad_ref, bias_grad_ref, _ = sdpa_vjp_ref(grad)
   if bias is not None and len(bias.shape) == 3:
@@ -490,6 +533,55 @@ class DotProductAttentionTest(jtu.JaxTestCase):
     self.assertArraysAllClose(query_grad_ref, query_grad, rtol=1e-2, atol=1e-2)
     self.assertArraysAllClose(key_grad_ref, key_grad, rtol=1e-5, atol=1e-5)
     self.assertArraysAllClose(value_grad_ref, value_grad, rtol=1e-5, atol=1e-5)
+
+  @jtu.run_on_devices("cuda")
+  def test_sdpa_packed_layout(self):
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(0), 4)
+    query = jax.random.normal(
+        k1, (4, 1024, 4, 64), dtype=jnp.bfloat16)
+    key = jax.random.normal(
+        k2, (4, 1024, 4, 64), dtype=jnp.bfloat16)
+    value = jax.random.normal(
+        k3, (4, 1024, 4, 64), dtype=jnp.bfloat16)
+    grad = jax.random.normal(
+        k4, (4, 1024, 4, 64), dtype=jnp.bfloat16)
+    devices = np.array(jax.local_devices()[:4])
+    devices = devices.reshape((2, 2))
+    with Mesh(devices, ("dp", "tp")) as mesh:
+      qkv_spec = PartitionSpec("dp", None, "tp", None)
+      qkv_sharding = NamedSharding(mesh, qkv_spec)
+      replicated = NamedSharding(mesh, PartitionSpec())
+      in_shardings = (qkv_sharding, qkv_sharding, qkv_sharding, qkv_sharding)
+      out_shardings = (qkv_sharding, (qkv_sharding, qkv_sharding, qkv_sharding))
+      query = jax.device_put(query, qkv_sharding)
+      key = jax.device_put(key, qkv_sharding)
+      value = jax.device_put(value, qkv_sharding)
+      grad = jax.device_put(grad, qkv_sharding)
+
+      jitted_sdpa_train = jax.jit(
+        partial(
+          sdpa_train, scale=1.0, mask_type=MaskType.NO_MASK, dropout_rate=0,
+          is_packed=True),
+        in_shardings=in_shardings,
+        out_shardings=out_shardings
+      )
+
+      jitted_sdpa_train_ref = jax.jit(
+        partial(
+          sdpa_train_ref, scale=1.0, mask_type=MaskType.NO_MASK, dropout_rate=0,
+          is_packed=True),
+        in_shardings=in_shardings,
+        out_shardings=out_shardings
+      )
+
+      out, (query_grad, key_grad, value_grad) = \
+        jitted_sdpa_train(query, key, value, grad)
+      out_ref, (query_grad_ref, key_grad_ref, value_grad_ref) = \
+        jitted_sdpa_train_ref(query, key, value, grad)
+      self.assertArraysAllClose(out_ref, out, rtol=1e-5, atol=1e-5)
+      self.assertArraysAllClose(query_grad_ref, query_grad, rtol=1e-2, atol=1e-2)
+      self.assertArraysAllClose(key_grad_ref, key_grad, rtol=1e-5, atol=1e-5)
+      self.assertArraysAllClose(value_grad_ref, value_grad, rtol=1e-5, atol=1e-5)
 
   @jtu.run_on_devices("cuda")
   def test_layouts(self):

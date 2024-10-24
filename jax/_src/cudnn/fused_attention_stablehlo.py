@@ -100,7 +100,6 @@ def default_layouts(*shapes):
   return [range(len(shape) - 1, -1, -1) for shape in shapes]
 
 def get_max_seg_per_batch(q_offsets):
-  print(q_offsets.shape)
   return q_offsets.shape[1] - 1 if len(q_offsets.shape) == 2 else 1
 
 def create_dot_product_attention_backend_config(batch,
@@ -424,7 +423,6 @@ def _dot_product_attention_fwd_impl(
   # args: {Q, K, V, mask*, bias*}
   q_seqlen, kv_seqlen, q_offsets, kv_offsets = \
       _fix_if_packed(q_seqlen, kv_seqlen, q_offsets, kv_offsets, query, key)
-  print(q_seqlen, kv_seqlen, q_offsets, kv_offsets, query)
   outputs = _dot_product_attention_fwd_p.bind(
       query, key, value, bias, q_seqlen, kv_seqlen, q_offsets, kv_offsets,
       scale=scale, seed=seed, dropout_rate=dropout_rate,

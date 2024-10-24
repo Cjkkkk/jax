@@ -333,7 +333,7 @@ class DotProductAttentionTest(jtu.JaxTestCase):
         k3, (4, 1024, 4, 64), dtype=jnp.bfloat16)
     grad = jax.random.normal(
         k4, (4, 1024, 4, 64), dtype=jnp.bfloat16)
-    seqlen = jnp.full((4,), 512, jnp.int32)
+
     jitted_sdpa_train = jax.jit(
       partial(
         sdpa_train, scale=1.0, mask_type=MaskType.PADDING, dropout_rate=0),
@@ -345,7 +345,7 @@ class DotProductAttentionTest(jtu.JaxTestCase):
     )
 
     out, (query_grad, key_grad, value_grad) = \
-      jitted_sdpa_train(query, key, value, grad, seqlen=seqlen)
+      jitted_sdpa_train(query, key, value, grad)
     out_ref, (query_grad_ref, key_grad_ref, value_grad_ref) = \
       jitted_sdpa_train_ref(query, key, value, grad)
     self.assertArraysAllClose(out_ref, out, rtol=1e-5, atol=1e-5)
@@ -500,12 +500,11 @@ class DotProductAttentionTest(jtu.JaxTestCase):
     grad = jax.random.normal(
         k4, (4, 1024, 4, 64), dtype=jnp.bfloat16)
 
-    def generate_offsets_and_seqlen(shape):
+    def generate_offsets_and_seqlen(num_segments, shape):
       # generate packed layout information
       B, T, N, H = shape
-      num_segments = 3
       segment_size = T // num_segments
-      offsets = jax.lax.iota(np.int32, num_segments) * segment_size * N * H
+      offsets = jax.lax.iota(np.int32, num_segments) * segment_size
       offsets = jnp.concatenate([offsets, jnp.array([-1], dtype=np.int32)])
       offsets = jax.lax.broadcast(offsets, (B,))
       # set actual seqlen of each segment as well
@@ -513,11 +512,10 @@ class DotProductAttentionTest(jtu.JaxTestCase):
       seqlen = jax.lax.broadcast(seqlen, (B,))
       return offsets, seqlen
 
-    def generate_segment_mask(shape, dtype):
+    def generate_segment_mask(num_segments, shape, dtype):
       # use a fixed pattern for segment_id where each batch has 3 segments
       # with same size, fill the rest with padded tokens
       B, T, N, _ = shape
-      num_segments = 3
       segment_size = T // num_segments
       segment_ids = jax.lax.iota(np.int32, T) // segment_size
       segment_ids_1 = jnp.expand_dims(segment_ids, axis=0)
@@ -528,50 +526,50 @@ class DotProductAttentionTest(jtu.JaxTestCase):
       mask *= get_large_negative_number(dtype)
       return mask
 
-    offsets, seqlen = generate_offsets_and_seqlen(query.shape)
-    bias = generate_segment_mask(query.shape, query.dtype)
-    # devices = np.array(jax.local_devices()[:4])
-    # devices = devices.reshape((2, 2))
-    # with Mesh(devices, ("dp", "tp")) as mesh:
-    #   qkv_spec = PartitionSpec("dp", None, "tp", None)
-    #   qkv_sharding = NamedSharding(mesh, qkv_spec)
-    #   bias_spec = PartitionSpec("dp", "tp", None, None)
-    #   bias_sharding = NamedSharding(mesh, bias_spec)
-    #   offsets_specs = PartitionSpec("dp", None)
-    #   offsets_sharding = NamedSharding(mesh, offsets_specs)
+    offsets, seqlen = generate_offsets_and_seqlen(4, query.shape)
+    bias = generate_segment_mask(4, query.shape, query.dtype)
+    devices = np.array(jax.local_devices()[:4])
+    devices = devices.reshape((2, 2))
+    with Mesh(devices, ("dp", "tp")) as mesh:
+      qkv_spec = PartitionSpec("dp", None, "tp", None)
+      qkv_sharding = NamedSharding(mesh, qkv_spec)
+      bias_spec = PartitionSpec("dp", "tp", None, None)
+      bias_sharding = NamedSharding(mesh, bias_spec)
+      offsets_specs = PartitionSpec("dp", None)
+      offsets_sharding = NamedSharding(mesh, offsets_specs)
 
-    #   query = jax.device_put(query, qkv_sharding)
-    #   key = jax.device_put(key, qkv_sharding)
-    #   value = jax.device_put(value, qkv_sharding)
-    #   grad = jax.device_put(grad, qkv_sharding)
-    #   bias = jax.device_put(bias, bias_sharding)
-    #   offsets = jax.device_put(offsets, offsets_sharding)
-    #   seqlen = jax.device_put(seqlen, offsets_sharding)
+      query = jax.device_put(query, qkv_sharding)
+      key = jax.device_put(key, qkv_sharding)
+      value = jax.device_put(value, qkv_sharding)
+      grad = jax.device_put(grad, qkv_sharding)
+      bias = jax.device_put(bias, bias_sharding)
+      offsets = jax.device_put(offsets, offsets_sharding)
+      seqlen = jax.device_put(seqlen, offsets_sharding)
 
-    jitted_sdpa_train = jax.jit(
-      partial(
-        sdpa_train, scale=1.0, mask_type=MaskType.NO_MASK, dropout_rate=0),
-      # in_shardings=(qkv_sharding, qkv_sharding, qkv_sharding, qkv_sharding,
-      #               None, None, offsets_sharding, offsets_sharding),
-      # out_shardings=(qkv_sharding, (qkv_sharding, qkv_sharding, qkv_sharding))
-    )
+      jitted_sdpa_train = jax.jit(
+        partial(
+          sdpa_train, scale=1.0, mask_type=MaskType.NO_MASK, dropout_rate=0),
+        in_shardings=(qkv_sharding, qkv_sharding, qkv_sharding, qkv_sharding,
+                      None, None, offsets_sharding, offsets_sharding),
+        out_shardings=(qkv_sharding, (qkv_sharding, qkv_sharding, qkv_sharding))
+      )
 
-    jitted_sdpa_train_ref = jax.jit(
-      partial(
-        sdpa_train_ref, scale=1.0, mask_type=MaskType.NO_MASK, dropout_rate=0),
-      # in_shardings=(qkv_sharding, qkv_sharding, qkv_sharding, qkv_sharding,
-      #               bias_sharding),
-      # out_shardings=(qkv_sharding, (qkv_sharding, qkv_sharding, qkv_sharding))
-    )
+      jitted_sdpa_train_ref = jax.jit(
+        partial(
+          sdpa_train_ref, scale=1.0, mask_type=MaskType.NO_MASK, dropout_rate=0),
+        in_shardings=(qkv_sharding, qkv_sharding, qkv_sharding, qkv_sharding,
+                      bias_sharding),
+        out_shardings=(qkv_sharding, (qkv_sharding, qkv_sharding, qkv_sharding))
+      )
 
-    out, (query_grad, key_grad, value_grad) = \
-      jitted_sdpa_train(query, key, value, grad, None, None, seqlen, offsets)
-    out_ref, (query_grad_ref, key_grad_ref, value_grad_ref) = \
-      jitted_sdpa_train_ref(query, key, value, grad, bias)
-    self.assertArraysAllClose(out_ref, out, rtol=1e-5, atol=1e-5)
-    self.assertArraysAllClose(query_grad_ref, query_grad, rtol=1e-2, atol=1e-2)
-    self.assertArraysAllClose(key_grad_ref, key_grad, rtol=1e-5, atol=1e-5)
-    self.assertArraysAllClose(value_grad_ref, value_grad, rtol=1e-5, atol=1e-5)
+      out, (query_grad, key_grad, value_grad) = \
+        jitted_sdpa_train(query, key, value, grad, None, None, seqlen, offsets)
+      out_ref, (query_grad_ref, key_grad_ref, value_grad_ref) = \
+        jitted_sdpa_train_ref(query, key, value, grad, bias)
+      self.assertArraysAllClose(out_ref, out, rtol=1e-5, atol=1e-5)
+      self.assertArraysAllClose(query_grad_ref, query_grad, rtol=1e-2, atol=1e-2)
+      self.assertArraysAllClose(key_grad_ref, key_grad, rtol=1e-5, atol=1e-5)
+      self.assertArraysAllClose(value_grad_ref, value_grad, rtol=1e-5, atol=1e-5)
 
   @jtu.run_on_devices("cuda")
   def test_layouts(self):

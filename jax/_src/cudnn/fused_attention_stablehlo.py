@@ -378,8 +378,9 @@ def _dot_product_attention_bwd_rule(
   grads = (*grads,) + (None,) * (8 - len(grads))
   return grads
 
-def _fix_if_packed(q_seqlen, kv_seqlen, q_offsets, kv_offsets, query, key):
+def _fix_seqlen_offsets(q_seqlen, kv_seqlen, q_offsets, kv_offsets, query, key):
   def _shift_to_left(x):
+    # shift any non-negative value to left
     # [[1, 3, -1, -1], [2, 3, 4, -1]]
     # -> [[1, 3, 2, 3], [4, -1, -1, -1]]
     x_shape = x.shape
@@ -389,29 +390,36 @@ def _fix_if_packed(q_seqlen, kv_seqlen, q_offsets, kv_offsets, query, key):
     y = jnp.take(x, indices, fill_value=0)
     return jnp.reshape(y, x_shape)
 
-  def _cu_offset(offsets, offset_per_batch):
-    # [[1, 3, 2, 3], [4, 5, -1, -1]], offset_per_batch = 8
-    # -> [[1, 3, 2, 3], [12, 13, -1, -1]]
+  def _cu_offset(offsets, max_seq):
+    # calculate accumulative offset by batch
+    # [[1, 3, 5, 7], [4, 5, -1, -1]], max_seq = 8
+    # -> [[1, 3, 5, 7], [12, 13, -1, -1]]
     batch = offsets.shape[0]
     offsets = jnp.where(
         offsets >= 0,
-        offsets + (jnp.arange(batch) * offset_per_batch)[..., jnp.newaxis],
+        offsets + (jnp.arange(batch) * max_seq)[..., jnp.newaxis],
         offsets,
     )
     return offsets
 
   if get_max_seg_per_batch(q_offsets) > 1:
-    q_seqlen = _shift_to_left(q_seqlen)
-    kv_seqlen = _shift_to_left(kv_seqlen)
-
     B, T, N, H = query.shape
     _, S, _, _ = key.shape
 
-    q_offsets = _cu_offset(q_offsets, T * N * H)
-    kv_offsets = _cu_offset(kv_offsets, S * N * H)
+    q_seqlen = _shift_to_left(q_seqlen)
+    kv_seqlen = _shift_to_left(kv_seqlen)
+
+    q_offsets = _cu_offset(q_offsets, T)
+    kv_offsets = _cu_offset(kv_offsets, S)
     q_offsets = _shift_to_left(q_offsets)
     kv_offsets = _shift_to_left(kv_offsets)
 
+    # multiply by stride_per_token to get correct offsets
+    # do it here because real stride changes after sharding
+    q_offsets = q_offsets * N * H
+    kv_offsets = kv_offsets * N * H
+
+    # mark any invalid entries as maximum offset
     q_offsets = jnp.where(q_offsets < 0, query.size, q_offsets)
     kv_offsets = jnp.where(kv_offsets < 0, key.size, kv_offsets)
   return q_seqlen, kv_seqlen, q_offsets, kv_offsets
@@ -422,7 +430,7 @@ def _dot_product_attention_fwd_impl(
     sliding_window_length, is_training):
   # args: {Q, K, V, mask*, bias*}
   q_seqlen, kv_seqlen, q_offsets, kv_offsets = \
-      _fix_if_packed(q_seqlen, kv_seqlen, q_offsets, kv_offsets, query, key)
+      _fix_seqlen_offsets(q_seqlen, kv_seqlen, q_offsets, kv_offsets, query, key)
   outputs = _dot_product_attention_fwd_p.bind(
       query, key, value, bias, q_seqlen, kv_seqlen, q_offsets, kv_offsets,
       scale=scale, seed=seed, dropout_rate=dropout_rate,
@@ -435,7 +443,7 @@ def _dot_product_attention_bwd_impl(
     activation, fwd_output, grad_output, scale, seed, dropout_rate,
     variadic_args, mask_type, layout, sliding_window_length):
   q_seqlen, kv_seqlen, q_offsets, kv_offsets = \
-      _fix_if_packed(q_seqlen, kv_seqlen, q_offsets, kv_offsets, query, key)
+      _fix_seqlen_offsets(q_seqlen, kv_seqlen, q_offsets, kv_offsets, query, key)
   grads = _dot_product_attention_bwd_p.bind(
       query, key, value, bias, q_seqlen, kv_seqlen, q_offsets, kv_offsets,
       activation, fwd_output, grad_output, scale=scale, seed=seed,

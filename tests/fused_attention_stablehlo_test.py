@@ -52,12 +52,22 @@ def sdpa_train(query: Array,
                is_bnth: bool = False,
                dropout_rate: float = 0.1,
                sliding_window_length: int | None = None) -> Array:
+  if mask_type == MaskType.PADDING:
+    if is_bnth:
+      B, _, S, _ = query.shape
+    else:
+      B, S, _, _ = query.shape
+    q_seqlen = kv_seqlen = jnp.full((B,), S // 2, jnp.int32)
+  else:
+    q_seqlen = kv_seqlen = None
+  if seqlen is not None:
+    q_seqlen = kv_seqlen = seqlen
   out, sdpa_vjp = jax.vjp(
       partial(dot_product_attention, scale=scale, mask_type=mask_type,
               dropout_rate=dropout_rate,
               qkv_layout="BNTH" if is_bnth else "BTNH",
               sliding_window_length=sliding_window_length),
-      query, key, value, bias, mask, seqlen, seqlen, offsets, offsets)
+      query, key, value, bias, mask, q_seqlen, kv_seqlen, offsets, offsets)
   query_grad, key_grad, value_grad, bias_grad = sdpa_vjp(grad)[:4]
   if bias is not None and len(bias.shape) == 3:
     # has dbias
@@ -121,7 +131,6 @@ def sdpa_ref(query: Array,
       raise ValueError(
         f"Expect sliding_window_length > 0, got {sliding_window_length}.")
     bias = get_sliding_window_mask(logits, sliding_window_length)
-
   if mask is not None:
     large_negative_number = get_large_negative_number(logits.dtype)
     mask = jnp.where(mask, jnp.asarray(0, query.dtype), large_negative_number)
@@ -333,7 +342,6 @@ class DotProductAttentionTest(jtu.JaxTestCase):
         k3, (4, 1024, 4, 64), dtype=jnp.bfloat16)
     grad = jax.random.normal(
         k4, (4, 1024, 4, 64), dtype=jnp.bfloat16)
-
     jitted_sdpa_train = jax.jit(
       partial(
         sdpa_train, scale=1.0, mask_type=MaskType.PADDING, dropout_rate=0),
@@ -345,9 +353,9 @@ class DotProductAttentionTest(jtu.JaxTestCase):
     )
 
     out, (query_grad, key_grad, value_grad) = \
-      jitted_sdpa_train(query, key, value, grad)
+      jitted_sdpa_train(query, key, value, grad, None, None)
     out_ref, (query_grad_ref, key_grad_ref, value_grad_ref) = \
-      jitted_sdpa_train_ref(query, key, value, grad)
+      jitted_sdpa_train_ref(query, key, value, grad, None, None)
     self.assertArraysAllClose(out_ref, out, rtol=1e-5, atol=1e-5)
     self.assertArraysAllClose(query_grad_ref, query_grad, rtol=1e-2, atol=1e-2)
     self.assertArraysAllClose(key_grad_ref, key_grad, rtol=1e-5, atol=1e-5)

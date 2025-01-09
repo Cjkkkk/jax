@@ -16,7 +16,7 @@ import enum
 import functools
 import json
 import math
-from typing import TypedDict
+from typing import TypedDict, Callable
 
 import jax
 from jax import dtypes
@@ -1712,6 +1712,7 @@ def dot_product_attention(
     dropout_rate: float = 0.,
     qkv_layout: str = "BTNH",
     sliding_window_length: int | None = None,
+    attn_score_modifier: Callable[[Array], Array] | None = None,
     use_fp8: bool = False
 ):
   """Computes dot-product attention given query (Q), key (K), and value (V).

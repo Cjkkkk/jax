@@ -747,26 +747,30 @@ class DotProductAttentionTest(jtu.JaxTestCase):
   def test_sdpa_flex_attention(self):
     k1, k2, k3, k4 = jax.random.split(jax.random.key(0), 4)
     query = jax.random.normal(
-        k1, (4, 1024, 4, 64), dtype=jnp.bfloat16)
+        k1, (4, 4, 1024, 64), dtype=jnp.bfloat16)
     key = jax.random.normal(
-        k2, (4, 1024, 4, 64), dtype=jnp.bfloat16)
+        k2, (4, 4, 1024, 64), dtype=jnp.bfloat16)
     value = jax.random.normal(
-        k3, (4, 1024, 4, 64), dtype=jnp.bfloat16)
+        k3, (4, 4, 1024, 64), dtype=jnp.bfloat16)
 
+    soft_cap_scalar = jnp.array(3.0, dtype=query.dtype)
     def soft_cap(attn_score, soft_cap_scalar):
       return soft_cap_scalar * jax.lax.tanh(attn_score / soft_cap_scalar)
 
-    jaxpr, out_shapes = jax.make_jaxpr(
-      soft_cap, return_shape=True
-    )(query, 3.0)
-    print(str(jaxpr))
-    # jitted_sdpa_inference = jax.jit(
-    #   partial(
-    #     dot_product_attention, scale=1.0, mask_type=MaskType.NO_MASK,
-    #     dropout_rate=0),
-    #   in_shardings=in_shardings,
-    #   out_shardings=out_shardings
-    # )
+    # _, grad_soft_cap = jax.vjp(soft_cap, query, 3.0)
+    # def get_hlo(func, *args):
+    #   print(jax.jit(func).lower(*args).as_text("hlo"))
+    # get_hlo(soft_cap, query, soft_cap_scalar)
+    # get_hlo(grad_soft_cap, query)
+    # jaxpr, out_shapes = jax.make_jaxpr(
+    #   soft_cap, return_shape=True
+    # )(query, 3.0)
+    # print(str(jaxpr))
+    jitted_sdpa_inference = jax.jit(
+      partial(
+        dot_product_attention, scale=1.0, mask_type=MaskType.NO_MASK,
+        dropout_rate=0, attn_score_modifier=soft_cap, qkv_layout='BNTH'),
+    )
 
     # jitted_sdpa_inference_ref = jax.jit(
     #   partial(
@@ -775,7 +779,7 @@ class DotProductAttentionTest(jtu.JaxTestCase):
     #   out_shardings=out_shardings
     # )
 
-    # out = jitted_sdpa_inference(query, key, value, None, None)
+    out = jitted_sdpa_inference(query, key, value, None, None, modifier_args=(soft_cap_scalar,))
     # out_ref = jitted_sdpa_inference_ref(query, key, value, None, None)
     # self.assertArraysAllClose(out_ref, out, rtol=1e-5, atol=1e-5)
 

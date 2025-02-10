@@ -420,7 +420,7 @@ def _dot_product_attention_fwd_rule(
       sliding_window_length=sliding_window_length,
       attn_score_modifier=attn_score_modifier, is_training=True)
   res = (query, key, value, bias, q_seqlen, kv_seqlen, q_offsets,
-         kv_offsets, modifier_args,, outputs[1], outputs[0])
+         kv_offsets, modifier_args, outputs[1], outputs[0])
   return outputs[0], res
 
 def _dot_product_attention_bwd_rule(
@@ -833,7 +833,7 @@ def _dot_product_attention_fwd_batcher(
       modifier_args, scale=scale, seed=seed, dropout_rate=dropout_rate,
       variadic_args=variadic_args, mask_type=mask_type, layout=layout,
       sliding_window_length=sliding_window_length,
-      attn_score_modifier=attn_score_modifier,, is_training=is_training)
+      attn_score_modifier=attn_score_modifier, is_training=is_training)
 
   # reshape to original shape
   output = outputs[0]

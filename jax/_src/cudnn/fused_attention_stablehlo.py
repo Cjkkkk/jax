@@ -33,6 +33,7 @@ from jax.interpreters.mlir import hlo
 from jax.interpreters.mlir import ir
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
+import numpy as np
 
 Array = jnp.ndarray
 
@@ -518,7 +519,7 @@ def _dot_product_attention_fwd_impl(
       _fix_seqlen_offsets(q_seqlen, kv_seqlen, q_offsets, kv_offsets, query, key)
   outputs = _dot_product_attention_fwd_p.bind(
       query, key, value, bias, q_seqlen, kv_seqlen, q_offsets, kv_offsets,
-      scale=scale, seed=seed, dropout_rate=dropout_rate,
+      modifier_args, scale=scale, seed=seed, dropout_rate=dropout_rate,
       variadic_args=variadic_args, mask_type=mask_type, layout=layout,
       sliding_window_length=sliding_window_length,
       attn_score_modifier=jaxpr, is_training=is_training)
@@ -653,7 +654,6 @@ def _dot_product_attention_fwd_cuda_lowering(
     # attn_score = hlo.constant(
     #   ir.DenseElementsAttr.get(
     #       np.zeros((B, N, T, S), dtype=np.float32), type=query_type.element_type))
-    import numpy as np
     attn_score = mlir.ir_constant(np.zeros((B, N, T, S), dtype=ctx.avals_out[0].dtype))
     aval_out0 = ctx.avals_out[0]
     ctx.avals_out[0] = ctx.avals_out[0].update(shape=(B, N, T, S))
@@ -688,8 +688,8 @@ def _dot_product_attention_fwd_cuda_lowering(
     result_types=result_types,
     operands=operands,
     backend_config=backend_config,
-    # operand_layouts=default_layouts(
-    #   *[ir.RankedTensorType(operand.type).shape for operand in operands]),
+    operand_layouts=default_layouts(
+      *[ir.RankedTensorType(operand.type).shape for operand in operands]),
     result_layouts=result_layouts,
     called_computations=called_computations,
   )

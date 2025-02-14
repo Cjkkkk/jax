@@ -511,7 +511,6 @@ def _dot_product_attention_fwd_impl(
       B, T, N, _ = query.shape
       _, S, _, _ = key.shape
     attn_score = jax.core.ShapedArray((B, N, T, S), query.dtype)
-    print(attn_score)
     jaxpr = jax.make_jaxpr(attn_score_modifier)(attn_score, modifier_args)
   else:
     jaxpr = None
@@ -636,7 +635,7 @@ def _dot_product_attention_fwd_cuda_lowering(
       B, N, T, S, query_type.element_type, scale, seed, dropout_rate,
       mask_type, layout, sliding_window_length, max_seg_per_batch,
       is_bwd=False)
-  # {Q, K, V, bias*, q_seqlen*, kv_seqlen*,  q_offsets*, kv_offsets*, modifier_args*}
+  # {Q, K, V, bias*, q_seqlen*, kv_seqlen*, q_offsets*, kv_offsets*, modifier_args*}
   # {output, activation*, workspace}
   has_dropout = dropout_rate > 0
   operands = [query, key, value]
@@ -1889,6 +1888,8 @@ def dot_product_attention(
       q_offsets = jnp.zeros(0, dtype=query.dtype)
     if kv_offsets is None:
       kv_offsets = jnp.zeros(0, dtype=query.dtype)
+    if modifier_args is None:
+      modifier_args = (jnp.zeros(0, dtype=query.dtype), )
     output = _dot_product_attention(
         query, key, value, bias, q_seqlen, kv_seqlen, q_offsets, kv_offsets,
         modifier_args, scale, seed, dropout_rate, variadic_args, mask_type, layout.value,

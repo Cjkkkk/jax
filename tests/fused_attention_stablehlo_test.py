@@ -17,7 +17,7 @@ from absl.testing import absltest
 import os
 
 os.environ["XLA_FLAGS"] = \
-  "--xla_gpu_enable_cudnn_fmha=true --xla_gpu_fused_attention_use_cudnn_rng=true"
+  "--xla_gpu_enable_cudnn_fmha=true --xla_gpu_fused_attention_use_cudnn_rng=true --xla_dump_to=./hlo --xla_dump_hlo_as_text --xla_dump_hlo_pass_re=.* --xla_disable_hlo_passes=float-normalization-bf16"
 
 import numpy as np
 import jax
@@ -131,7 +131,9 @@ def sdpa_ref(query: Array,
       scale: float = 0.5,
       mask_type: MaskType = MaskType.NO_MASK,
       dropout_rate: float = 0.1,
-      sliding_window_length: int | None = None) -> Array:
+      sliding_window_length: int | None = None,
+      attn_score_modifier = None,
+      modifier_args = None) -> Array:
 
   def get_causal_mask(logits):
     large_negative_number = get_large_negative_number(logits.dtype)
@@ -191,6 +193,8 @@ def sdpa_ref(query: Array,
     if bias.shape != logits.shape:
       bias = jnp.broadcast_to(bias, logits.shape)
     logits = logits + bias.astype(logits.dtype)
+  if attn_score_modifier is not None:
+    logits = attn_score_modifier(logits, *modifier_args)
   probs = jax.nn.softmax(logits, axis=-1)
   if dropout_rate > 0.:
     keep_prob = 1.0 - dropout_rate
@@ -753,7 +757,9 @@ class DotProductAttentionTest(jtu.JaxTestCase):
     value = jax.random.normal(
         k3, (4, 4, 1024, 64), dtype=jnp.bfloat16)
 
-    soft_cap_scalar = jnp.array(3.0, dtype=query.dtype)
+    soft_cap_scalar = jax.random.normal(
+        k4, (4, 4, 1024, 1024), dtype=jnp.bfloat16)
+    # soft_cap_scalar = jnp.array([3.0], dtype=query.dtype)
     def soft_cap(attn_score, soft_cap_scalar):
       return soft_cap_scalar * jax.lax.tanh(attn_score / soft_cap_scalar)
 

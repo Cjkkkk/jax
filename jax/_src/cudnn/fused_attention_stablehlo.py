@@ -511,7 +511,7 @@ def _dot_product_attention_fwd_impl(
     modifier_args, scale, seed, dropout_rate, variadic_args, mask_type, layout,
     sliding_window_length, attn_score_modifier, is_training):
   # args: {Q, K, V, mask*, bias*}
-  fwd_jaxpr = None
+  jaxpr = None
   if attn_score_modifier is not None:
     if layout == AttentionLayout.BNTH.value:
       B, N, T, _ = query.shape

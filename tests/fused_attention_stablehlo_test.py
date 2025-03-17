@@ -900,6 +900,7 @@ class DotProductAttentionTest(jtu.JaxTestCase):
     soft_cap_scalar1 = jax.random.normal(
         k4, (4, 4, 1024, 1024), dtype=jnp.bfloat16)
 
+
     def soft_cap(attn_score, soft_cap_scalar, soft_cap_scalar1):
       return soft_cap_scalar1 * jax.lax.tanh(attn_score / soft_cap_scalar)
 

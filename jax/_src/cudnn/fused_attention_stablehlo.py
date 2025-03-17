@@ -508,7 +508,7 @@ def _fix_seqlen_offsets(q_seqlen, kv_seqlen, q_offsets, kv_offsets, query, key):
 
 def _dot_product_attention_fwd_impl(
     query, key, value, bias, q_seqlen, kv_seqlen, q_offsets, kv_offsets,
-    modifier_args, scale, seed, dropout_rate, variadic_args, mask_type, layout,
+    *modifier_args, scale, seed, dropout_rate, variadic_args, mask_type, layout,
     sliding_window_length, attn_score_modifier, is_training):
   # args: {Q, K, V, mask*, bias*}
   jaxpr = None
@@ -567,7 +567,7 @@ def _dot_product_attention_bwd_impl(
 
 def _dot_product_attention_fwd_abstract(
     query, key, value, bias, q_seqlen, kv_seqlen, q_offsets, kv_offsets,
-    modifier_args, *, scale, seed, dropout_rate, variadic_args, mask_type, layout,
+    *modifier_args, scale, seed, dropout_rate, variadic_args, mask_type, layout,
     sliding_window_length, attn_score_modifier, is_training):
   query_dtype = dtypes.canonicalize_dtype(query.dtype)
   if layout == AttentionLayout.BNTH.value:

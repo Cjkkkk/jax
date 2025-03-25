@@ -103,7 +103,7 @@ def sdpa_train(query: Array,
                kv_seqlen: Array | None = None,
                q_offsets: Array | None = None,
                kv_offsets: Array | None = None,
-               modifier_args: Tuple[Array] | None = None,
+               modifier_args: Tuple[Array] = (),
                scale: float = 0.5,
                mask_type: MaskType = MaskType.NO_MASK,
                is_bnth: bool = False,
@@ -135,7 +135,7 @@ def sdpa_ref(query: Array,
       value: Array,
       bias: Array | None = None,
       mask: Array | None = None,
-      modifier_args: Tuple[Array] | None = None,
+      modifier_args: Tuple[Array] = (),
       scale: float = 0.5,
       mask_type: MaskType = MaskType.NO_MASK,
       dropout_rate: float = 0.1,
@@ -204,7 +204,8 @@ def sdpa_ref(query: Array,
       bias = jnp.broadcast_to(bias, logits.shape)
     logits = logits + bias.astype(logits.dtype)
   if attn_score_modifier is not None:
-    logits = attn_score_modifier(logits, *modifier_args)
+    logits = attn_score_modifier(logits.astype(query.dtype), *modifier_args).astype(jnp.float32)
+    #logits = attn_score_modifier(logits, *modifier_args).astype(jnp.float32)
   probs = jax.nn.softmax(logits, axis=-1).astype(query.dtype)
   if dropout_rate > 0.:
     keep_prob = 1.0 - dropout_rate
@@ -230,7 +231,7 @@ def sdpa_train_ref(query: Array,
             dropout_rate: float = 0.1,
             sliding_window_length: int | None = None,
             attn_score_modifier = None,
-            modifier_args = None) -> Array:
+            modifier_args = ()) -> Array:
   out_ref, sdpa_vjp_ref = jax.vjp(
     partial(
       sdpa_ref, scale=scale, mask_type=mask_type, dropout_rate=dropout_rate,
@@ -765,10 +766,10 @@ class DotProductAttentionTest(jtu.JaxTestCase):
         k4, (4, 1024, 4, 64), dtype=jnp.bfloat16)
 
     soft_cap_scalar = jax.random.normal(
-        k5, (4, 4, 1024, 1024), dtype=jnp.bfloat16)
+        k5, (4, 4, 1024, 1024), dtype=jnp.float32)
 
-    def soft_cap(attn_score, soft_cap_scalar):
-      return soft_cap_scalar * jax.lax.tanh(attn_score / soft_cap_scalar)
+    def soft_cap(attn_score, soft_cap_scalar, soft_cap_scalar1):
+      return soft_cap_scalar1 * jax.lax.tanh(attn_score / soft_cap_scalar)
 
     jitted_sdpa = jax.jit(
       partial(
@@ -783,9 +784,9 @@ class DotProductAttentionTest(jtu.JaxTestCase):
     )
 
     out, (query_grad, key_grad, value_grad) = \
-      jitted_sdpa(query, key, value, grad, modifier_args=(soft_cap_scalar,))
+      jitted_sdpa(query, key, value, grad, modifier_args=(soft_cap_scalar, soft_cap_scalar))
     out_ref, (query_grad_ref, key_grad_ref, value_grad_ref) = \
-      jitted_sdpa_ref(query, key, value, grad, modifier_args=(soft_cap_scalar,))
+      jitted_sdpa_ref(query, key, value, grad, modifier_args=(soft_cap_scalar, soft_cap_scalar))
     self.assertArraysAllClose(out_ref, out, rtol=1e-2, atol=1e-2)
     self.assertArraysAllClose(query_grad_ref, query_grad, rtol=1e-2, atol=1e-2)
     self.assertArraysAllClose(key_grad_ref, key_grad, rtol=1e-2, atol=1e-2)
@@ -802,35 +803,10 @@ class DotProductAttentionTest(jtu.JaxTestCase):
 
     soft_cap_scalar = jax.random.normal(
         k4, (4, 4, 1024, 1024), dtype=jnp.bfloat16)
-    # soft_cap_scalar = jnp.array([3.0], dtype=query.dtype)
-    def soft_cap(attn_score, soft_cap_scalar):
-      soft_cap_scalar = jax.lax.stop_gradient(soft_cap_scalar)
-      return soft_cap_scalar * jax.lax.tanh(attn_score / soft_cap_scalar)
 
-    def soft_cap1(attn_score, soft_cap_scalar):
-      soft_cap_scalar = jax.lax.stop_gradient(soft_cap_scalar)
-      return soft_cap_scalar * attn_score
+    def soft_cap(attn_score, soft_cap_scalar, soft_cap_scalar1):
+      return soft_cap_scalar1 * jax.lax.tanh(attn_score / soft_cap_scalar)
 
-    query1 = jax.random.normal(
-        k1, (4, 4), dtype=jnp.bfloat16)
-    query2 = jax.random.normal(
-        k2, (4, 4), dtype=jnp.bfloat16)
-    grad1 = jax.random.normal(
-        k3, (4, 4), dtype=jnp.bfloat16)
-
-    def wrap(*args):
-      _, grad_soft_cap = jax.vjp(soft_cap, *args[:-1])
-      return grad_soft_cap(args[-1])[0]
-
-    def get_hlo(func, *args):
-      print(jax.jit(func).lower(*args).as_text("hlo"))
-    get_hlo(soft_cap1, query1, query2)
-    get_hlo(wrap, query1, query2, grad1)
-
-    # jaxpr, out_shapes = jax.make_jaxpr(
-    #   soft_cap, return_shape=True
-    # )(query, 3.0)
-    # print(str(jaxpr))
     jitted_sdpa_inference = jax.jit(
       partial(
         dot_product_attention, scale=1.0, mask_type=MaskType.NO_MASK,
@@ -843,81 +819,8 @@ class DotProductAttentionTest(jtu.JaxTestCase):
         attn_score_modifier=soft_cap),
     )
 
-    out = jitted_sdpa_inference(query, key, value, modifier_args=(soft_cap_scalar,))
-    out_ref = jitted_sdpa_inference_ref(query, key, value, modifier_args=(soft_cap_scalar,))
-    self.assertArraysAllClose(out_ref, out, rtol=1e-2, atol=1e-2)
-
-  def test_sdpa_flex_attention_train(self):
-    k1, k2, k3, k4, k5 = jax.random.split(jax.random.key(0), 5)
-    query = jax.random.normal(
-        k1, (4, 1024, 4, 64), dtype=jnp.bfloat16)
-    key = jax.random.normal(
-        k2, (4, 1024, 4, 64), dtype=jnp.bfloat16)
-    value = jax.random.normal(
-        k3, (4, 1024, 4, 64), dtype=jnp.bfloat16)
-    grad = jax.random.normal(
-        k4, (4, 1024, 4, 64), dtype=jnp.bfloat16)
-
-    soft_cap_scalar = jax.random.normal(
-        k5, (4, 4, 1024, 1024), dtype=jnp.bfloat16)
-
-    def soft_cap(attn_score, soft_cap_scalar):
-      return soft_cap_scalar * jax.lax.tanh(attn_score / soft_cap_scalar)
-
-    jitted_sdpa = jax.jit(
-      partial(
-        sdpa_train, scale=1.0, mask_type=MaskType.NO_MASK,
-        dropout_rate=0, attn_score_modifier=soft_cap),
-    )
-
-    jitted_sdpa_ref = jax.jit(
-      partial(
-        sdpa_train_ref, scale=1.0, mask_type=MaskType.NO_MASK,
-        dropout_rate=0, attn_score_modifier=soft_cap),
-    )
-
-    out, (query_grad, key_grad, value_grad) = \
-      jitted_sdpa(query, key, value, grad, modifier_args=(soft_cap_scalar,))
-    out_ref, (query_grad_ref, key_grad_ref, value_grad_ref) = \
-      jitted_sdpa_ref(query, key, value, grad, modifier_args=(soft_cap_scalar,))
-    self.assertArraysAllClose(out_ref, out, rtol=1e-2, atol=1e-2)
-    self.assertArraysAllClose(query_grad_ref, query_grad, rtol=1e-2, atol=1e-2)
-    self.assertArraysAllClose(key_grad_ref, key_grad, rtol=1e-2, atol=1e-2)
-    self.assertArraysAllClose(value_grad_ref, value_grad, rtol=1e-2, atol=1e-2)
-
-  def test_sdpa_flex_attention1(self):
-    k1, k2, k3, k4 = jax.random.split(jax.random.key(0), 4)
-    query = jax.random.normal(
-        k1, (4, 1024, 4, 64), dtype=jnp.bfloat16)
-    key = jax.random.normal(
-        k2, (4, 1024, 4, 64), dtype=jnp.bfloat16)
-    value = jax.random.normal(
-        k3, (4, 1024, 4, 64), dtype=jnp.bfloat16)
-
-    soft_cap_scalar = jax.random.normal(
-        k4, (4, 4, 1024, 1024), dtype=jnp.bfloat16)
-
-    soft_cap_scalar1 = jax.random.normal(
-        k4, (4, 4, 1024, 1024), dtype=jnp.bfloat16)
-
-
-    def soft_cap(attn_score, soft_cap_scalar, soft_cap_scalar1):
-      return soft_cap_scalar1 * jax.lax.tanh(attn_score / soft_cap_scalar)
-
-    jitted_sdpa_inference = jax.jit(
-      partial(
-        dot_product_attention, scale=1.0, mask_type=MaskType.NO_MASK,
-        dropout_rate=0, attn_score_modifier=soft_cap),
-    )
-
-    # jitted_sdpa_inference_ref = jax.jit(
-    #   partial(
-    #     sdpa_ref, scale=1.0, mask_type=MaskType.NO_MASK, dropout_rate=0,
-    #     attn_score_modifier=soft_cap),
-    # )
-
-    out = jitted_sdpa_inference(query, key, value, modifier_args=(soft_cap_scalar, soft_cap_scalar1))
-    # out_ref = jitted_sdpa_inference_ref(query, key, value, modifier_args=(soft_cap_scalar, soft_cap_scalar1))
+    out = jitted_sdpa_inference(query, key, value, modifier_args=(soft_cap_scalar, soft_cap_scalar))
+    # out_ref = jitted_sdpa_inference_ref(query, key, value, modifier_args=(soft_cap_scalar, soft_cap_scalar))
     # self.assertArraysAllClose(out_ref, out, rtol=1e-2, atol=1e-2)
 
   @jtu.run_on_devices("cuda")
